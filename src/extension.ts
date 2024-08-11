@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
-import { Node, parse, Program } from 'acorn';
-import { simple as walkSimple, findNodeAt } from 'acorn-walk';
+import { Node, Program } from 'estree';
+import { parse as jsParse } from 'acorn';
+import { parse as tsParse } from '@typescript-eslint/typescript-estree';
 
 interface FunctionComplexity {
     complexity: number;
@@ -8,147 +9,115 @@ interface FunctionComplexity {
     end_line: number;
 }
 
+const supportedLanguages = ['javascript', 'typescript'];
+
 export function activate(context: vscode.ExtensionContext) {
-    let activeEditor = vscode.window.activeTextEditor;
+    let provider = new ComplexityCodeLensProvider();
+    supportedLanguages.forEach(lang => {
+        context.subscriptions.push(vscode.languages.registerCodeLensProvider({ language: lang }, provider));
+    });
+}
 
-    console.log('Cyclotron" is now active!');
-
-    // const complexityDisposable = vscode.commands.registerCommand('cyclotron.calculateComplexity', () => {
-    //     calculateComplexity();
-    // });
-
-    // context.subscriptions.push(complexityDisposable);
-
-    // Function to update the function decoration based on cyclomatic complexity
-    async function updateFunctionDecoration() {
-
-        if (!activeEditor) {
-            return;
-        }
-
-        const functionComplexity = await calculateComplexityForActiveFunction(activeEditor);
-        if (functionComplexity) {
-            const decorationType = getDecorationTypeForComplexity(functionComplexity.complexity);
-
-            // Create a decoration range that spans the entire function
-            const range = new vscode.Range(functionComplexity.start_line, 0, functionComplexity.end_line, 100);
-
-            const decorationOptions: vscode.DecorationOptions[] = [{ range: range, hoverMessage: `Function complexity: ${functionComplexity.complexity}` }];
-            activeEditor.setDecorations(decorationType, decorationOptions);
-        }
-    }
-
-    // Listen for when the active text editor changes
-    vscode.window.onDidChangeActiveTextEditor(editor => {
-        activeEditor = editor;
-        if (editor) {
-            updateFunctionDecoration();
-        }
-    }, null, context.subscriptions);
-
-    // Listen for document changes
-    vscode.workspace.onDidChangeTextDocument(event => {
-        if (activeEditor && event.document === activeEditor.document) {
-            updateFunctionDecoration();
-        }
-    }, null, context.subscriptions);
-
-    // Initial update
-    if (activeEditor) {
-        updateFunctionDecoration();
+export class ComplexityCodeLensProvider implements vscode.CodeLensProvider {
+    public provideCodeLenses(document: vscode.TextDocument, _token: vscode.CancellationToken): vscode.CodeLens[] | Thenable<vscode.CodeLens[]> {
+        // Placeholder for actual complexity calculation logic
+        // For demonstration, we'll assume a function that asynchronously calculates complexity for all functions in a document
+        return calculateComplexitiesForDocument(document).then(complexities => {
+            return complexities.map(func => {
+                let range = new vscode.Range(func.start_line, 0, func.start_line, 0);
+                let command: vscode.Command = {
+                    title: `Complexity: ${func.complexity}`, // Display complexity in the CodeLens
+                    command: '', // Optionally, specify a command to execute on click
+                    arguments: [] // Pass any arguments to the command if needed
+                };
+                return new vscode.CodeLens(range, command);
+            });
+        });
     }
 }
 
-export function deactivate() { }
+type ParserFunc = typeof jsParse | typeof tsParse;
 
-function calculateComplexityForActiveFunction(editor: vscode.TextEditor): FunctionComplexity | null {
-    // const editor = vscode.window.activeTextEditor;
-    if (!editor) {
-        vscode.window.showInformationMessage('No active editor.');
-        return null;
-    }
-
-    const document = editor.document;
-    const position = editor.selection.active;
-    const text = document.getText();
-    const offset = document.offsetAt(position);
-
-    try {
-        const ast = parse(text, { ecmaVersion: 2020, sourceType: "module", locations: true });
-        const node = findCurrentFunctionNode(ast, offset);
-
-        if (node) {
-            return calculateFunctionComplexity(node);
-        }
-    } catch (error: unknown) {
-        // vscode.window.showErrorMessage('Error parsing JavaScript: ' + (error as Error).message);
+export function getParserForLanguage(language: string): ParserFunc | null {
+    switch (language) {
+        case 'javascript':
+            return jsParse;
+        case 'typescript':
+            return tsParse;
     }
     return null;
 }
 
-function findCurrentFunctionNode(ast: Program, offset: number): Node | null {
-    let currentFunctionNode = null;
+function calculateDocumentComplexities(code: string, parse: ParserFunc): FunctionComplexity[] {
+    const ast = (parse(code, { ecmaVersion: 2020, sourceType:"script", loc: true, locations: true }) as Program);
+    const complexities: FunctionComplexity[] = [];
 
-    walkSimple(ast, {
-        Function(node, _state) {
-            if (node.start <= offset && node.end >= offset) {
-                currentFunctionNode = node;
+    function calculateComplexity(node: Node): FunctionComplexity {
+        let complexity = 1; // Base complexity for a function
+
+        function traverse(node: Node) {
+            switch (node.type) {
+                case "IfStatement":
+                case "ForStatement":
+                case "WhileStatement":
+                case "DoWhileStatement":
+                case "SwitchCase":
+                    complexity++;
+                    break;
+            }
+
+            for (const key in node) {
+                if (node.hasOwnProperty(key)) {
+                    const child = (node as any)[key];
+                    if (Array.isArray(child)) {
+                        child.forEach(traverse);
+                    } else if (typeof child === "object" && child !== null) {
+                        traverse(child);
+                    }
+                }
             }
         }
-    });
 
-    return currentFunctionNode;
+        traverse(node); // Start traversing from the body of the function
+        return {
+            start_line: (node.loc? node.loc.start.line - 1 : -1),
+            end_line: (node.loc? node.loc.end.line - 1 : -1),
+            complexity,
+        };
+    }
+
+    function traverseAST(node: Node) {
+        if (node.type === "FunctionDeclaration" || node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression") {
+            complexities.push(calculateComplexity(node));
+        }
+
+        for (const key in node) {
+            if (node.hasOwnProperty(key)) {
+                const child = (node as any)[key];
+                if (Array.isArray(child)) {
+                    child.forEach(traverseAST);
+                } else if (typeof child === "object" && child !== null) {
+                    traverseAST(child);
+                }
+            }
+        }
+    }
+
+    traverseAST(ast); // Start traversing the AST
+    return complexities;
 }
 
-function calculateFunctionComplexity(node: Node): FunctionComplexity | null {
-    let complexity = 1;
-
-    walkSimple(node, {
-        IfStatement() { complexity++; },
-        ForStatement() { complexity++; },
-        WhileStatement() { complexity++; },
-        DoWhileStatement() { complexity++; },
-        SwitchCase() { complexity++; },
-        LogicalExpression() { complexity++; },
-    });
-
-    return {
-        start_line: node?.loc?.start.line - 1,
-        end_line: node?.loc?.end.line,
-        complexity,
-    };
-}
-
-function getDecorationTypeForComplexity(complexity: number): vscode.TextEditorDecorationType {
-    // Define the base red color
-    const baseRed = 244;
-    const baseGreen = 67;
-    const baseBlue = 54;
-
-    // Define the complexity range where color fading starts and ends
-    const config = vscode.workspace.getConfiguration('Cyclotron');
-    const startComplexity = config.get<number>('startComplexity', 11);
-    const maxComplexity = config.get<number>('maxComplexity', 51);
-    const complexityRange = maxComplexity - startComplexity;
-
-    // Adjust the darken factor based on the new complexity range
-    const maxDarkenAmount = 180; // This is the maximum amount the color can darken
-    let darkenFactor = complexity > startComplexity ? (complexity - startComplexity) / complexityRange : 0;
-    darkenFactor = Math.min(darkenFactor, 1); // Ensure darkenFactor does not exceed 1
-
-    // Calculate the new color based on complexity. Ensure it doesn't go below the minimum allowed values.
-    let newRed = baseRed - (maxDarkenAmount * darkenFactor);
-    let newGreen = baseGreen - (maxDarkenAmount * darkenFactor / 2);
-    let newBlue = baseBlue - (maxDarkenAmount * darkenFactor / 2);
-
-    // Ensure the color values do not go below 0
-    newRed = Math.max(newRed, 0);
-    newGreen = Math.max(newGreen, 0);
-    newBlue = Math.max(newBlue, 0);
-
-    // Create a new decoration type with the calculated color
-    return vscode.window.createTextEditorDecorationType({
-        backgroundColor: `rgba(${newRed}, ${newGreen}, ${newBlue}, 0.3)`,
+function calculateComplexitiesForDocument(document: vscode.TextDocument): Promise<FunctionComplexity[]> {
+    return new Promise((resolve, _reject) => {
+        const code = document.getText();
+        const parse = getParserForLanguage(document.languageId);
+        if (!parse) {
+            resolve([]);
+            return;
+        }
+        const complexities = calculateDocumentComplexities(code, parse);
+        resolve(complexities);
     });
 }
 
+export function deactivate() { }
